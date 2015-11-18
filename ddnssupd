@@ -1,0 +1,270 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+#  ddnssupd.py
+#  
+#  Copyright 2015 Joshua Jensch <doktorjayjay@gmail.com>
+#  
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#  
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#  
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#  
+#  
+
+import sys, os, time, atexit, urllib2, socket, ConfigParser, logging, re
+from signal import SIGTERM
+
+class Daemon(object):
+	def __init__(self, pidfile, stdin="/dev/null", stdout="/dev/null", stderr="/dev/null"):
+		self.stdin = stdin
+		self.stdout = stdout
+		self.stderr = stderr
+		self.pidfile = pidfile
+	
+	def daemonize(self):
+		#do unix doublefork
+		try:
+			pid=os.fork()
+			if pid > 0:
+				sys.exit(0)
+		except OSError, e:
+			sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+			sys.exit(1)
+		
+		#decouple from parent environment
+		os.chdir("/")
+		os.setsid()
+		os.umask(0)
+		
+		#second fork
+		try:
+			pid = os.fork()
+			if pid > 0:
+				sys.exit(0)
+		except OSError, e:
+			sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+			sys.exit(1)
+		
+		#redirect standard file descriptors
+		sys.stdout.flush()
+		sys.stderr.flush()
+		si = file(self.stdin, 'r')
+		so = file(self.stdout, 'a+')
+		se = file(self.stderr, 'a+', 0)
+		os.dup2(si.fileno(), sys.stdin.fileno())
+		os.dup2(so.fileno(), sys.stdout.fileno())
+		os.dup2(se.fileno(), sys.stderr.fileno())
+		
+		#write pidfile
+		atexit.register(self.delpid)
+		pid=str(os.getpid())
+		pf = open(self.pidfile, 'w+')
+		pf.write("%s\n" % pid)
+		pf.close()
+		
+	def delpid(self):
+		os.remove(self.pidfile)
+	
+	def isRunning(self):
+		try:
+			pf = file(self.pidfile, 'r')
+			pid = int(pf.read().strip())
+			pf.close()
+			return True
+		except IOError:
+			return False
+	
+	def getPID(self):
+		try:
+			pf = file(self.pidfile, 'r')
+			pid = int(pf.read().strip())
+			pf.close()
+		except IOError:
+			pid=None
+		return pid
+	
+	def start(self):
+		if self.isRunning():
+			sys.stderr.write("pidfile %s already exists. Daemon already running.\n" % self.pidfile)
+			sys.exit(1)
+		
+		#start the daemon
+		self.daemonize()
+		self.run()
+		
+	def stop(self):
+		pid = self.getPID()
+		
+		if not pid:
+			sys.stderr.write("pidfile %s does not exist. Daemon not running.\n" % self.pidfile)
+			return #not an error in restart
+		
+		#try killing the daemon process
+		try:
+			while 1:
+				os.kill(pid, SIGTERM)
+				time.sleep(0.1)
+		except OSError, err:
+			err = str(err)
+			if err.find("No such process") > 0:
+				if os.path.exists(self.pidfile):
+					os.remove(self.pidfile)
+			else:
+				print str(err)
+				sys.exit(1)
+	def restart(self):
+		self.stop()
+		self.start()
+		
+	def run(self):
+		return
+
+def getIP():
+	try:
+		ip = urllib2.urlopen("http://canihazip.com/s").read()
+	except IOError:
+		return None
+	return ip
+
+def getConfig(cfg):
+	d={}
+	f=open(cfg,'r')
+	for line in f:
+		(k,v) = line.split(":")
+		d[k.strip()]=v.strip()
+	return d
+
+logfile="/var/log/ddnssupd"
+		
+def setLogger(mode="a"):
+	logging.basicConfig(filename=logfile, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", filemode=mode)
+
+class MyDaemon(Daemon):
+	
+	def __init__(self, pidfile, stdin="/dev/null", stdout="/dev/null", stderr="/dev/null"):
+		super(MyDaemon, self).__init__(pidfile, stdin, stdout, stderr)
+		setLogger()
+	
+	def start(self):
+		logging.info("Starting ...")
+		super(MyDaemon, self).start()
+		
+	def stop(self):
+		logging.info("Stopping ...\n")
+		super(MyDaemon, self).stop()
+		
+	def restart(self):
+		logging.info("Restarting ...")
+		super(MyDaemon, self).restart()
+		
+	
+	def ddnssupd(self, url):
+		logging.info("Updating %s" % url)
+		result = urllib2.urlopen(url).read()
+		ot,res,ct = re.findall('(<p>|<blockquote>)(.*?)(</blockquote>|</p>)', result)
+		err=False
+		for lin in res:
+			if "Error" in lin:
+				err=True
+				break
+		if not err:
+			logging.info("\n".join(res))
+		else:
+			logging.error("\n".join(res))
+			logging.error("stoping ...")
+			self.stop()
+	
+	def run(self):
+		logging.info("Running ...")
+		if not os.path.exists("/etc/ddnssupd"):
+			logging.error("config file not found. exiting...")
+			self.stop()
+			sys.exit(4)
+		
+		config=getConfig("/etc/ddnssupd")
+		
+		
+		interval = 30
+		if 'Interval' in config:
+			interval = config["Interval"]
+			
+		interval=float(interval)
+		
+		if not 'Key' in config:
+			logging.error("Could not find Key value in /etc/ddnssupd ... Exiting")
+			self.stop()
+			sys.exit(3)
+		
+		key = config["Key"]
+		hosts = "all"
+		if 'Hosts' in config:
+			hosts = config["Hosts"]
+		
+		updurl = "http://www.ddnss.de/upd.php?key=$KEY&host=$HOST"
+		updurl = updurl.replace("$KEY", key)
+		updurl = updurl.replace("$HOST", hosts)
+		
+		logging.info("Domains will be updated by calling %s ..." % updurl)
+		
+		ip = getIP()
+		first=True
+		
+		while True:
+			newip=getIP()
+			if hosts=="all":
+				if ip != newip or first:
+					self.ddnssupd(updurl)
+					ip = newip
+			else:
+				updated=False
+				ip=newip
+				logging.debug(",".join(hosts.split(",")))
+				for h in hosts.split(","):
+					hip=socket.gethostbyname(h)
+					logging.debug("Checking %s and %s for diff... %s" % (hip,ip,str(hip!=ip)))
+					if ip != hip:
+						self.ddnssupd(updurl)
+						updated=True
+						break
+				
+				logging.debug("Updated: %s" % str(updated))
+				
+			first=False
+			time.sleep(interval)
+			
+
+if __name__ == "__main__":
+	daemon = MyDaemon("/tmp/ddnssupd.pid")
+	
+	if len(sys.argv) == 2:
+		if 'start' == sys.argv[1]:
+			daemon.start()
+		elif 'stop' == sys.argv[1]:
+			daemon.stop()
+		elif 'restart' == sys.argv[1]:
+			daemon.restart()
+		elif 'status' == sys.argv[1]:
+			if not daemon.isRunning():
+				print "daemon is not running"
+				sys.exit(3)
+			else:
+				print "daemon is running"
+				sys.exit(0)
+			print msg
+		else:
+			print "Unknown command"
+			sys.exit(2)
+	else:
+		print "usage: %s start|stop|restart|status" % sys.argv[0]
+		sys.exit(2)
