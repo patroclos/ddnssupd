@@ -22,19 +22,24 @@ do
 	fi
 
 	if [ $dip != $mip ]; then
-		echo "[*] Updating domains."
+		echo "[*] Updating $dom($dip) -> $mip."
+		udomains="$udomains $dom"
 	fi
 done
 
 dlist=""
 for dom in $udomains
 do
-	if [ -z $dlist ]
+	if [ -z $dlist ]; then
 		dlist="$dom"
 	else
 		dlist="$dlist,$dom"
 	fi
 done
+if [ -z $dlist ]; then
+	echo "[*] Domains are already up to date."
+	exit 0
+fi
 updurl="https://ddnss.de/upd.php?key=$updkey&host=$dlist"
 wget -qO - $updurl > /tmp/updddns_response
 grep Error /tmp/updddns_response -qs
